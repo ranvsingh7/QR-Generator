@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import { Download, X, Share, SquarePlus, WifiOff, RefreshCw } from 'lucide-react';
 
 interface BeforeInstallPromptEvent extends Event {
@@ -130,6 +131,21 @@ export function PWAInstall() {
     };
   }, []);
 
+  // While the guide is open: lock page scroll and close on Escape
+  useEffect(() => {
+    if (!showIOSGuide) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowIOSGuide(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [showIOSGuide]);
+
   const handleInstall = useCallback(async () => {
     if (deferredPrompt) {
       try {
@@ -169,12 +185,24 @@ export function PWAInstall() {
         )}
       </div>
 
-      {/* iOS: Safari has no install prompt, so show the steps */}
-      {showIOSGuide && (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4" onClick={() => setShowIOSGuide(false)}>
-          <div className="w-full max-w-sm bg-white rounded-2xl p-5 shadow-xl animate-slide-up" onClick={(e) => e.stopPropagation()}>
+      {/* iOS: Safari has no install prompt, so show the steps.
+          Rendered into <body> via a portal: the sticky header uses backdrop-blur, which would
+          otherwise trap this fixed overlay inside the header and push it off the top of the screen. */}
+      {showIOSGuide &&
+        createPortal(
+        <div
+          className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center overflow-y-auto bg-black/40 px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))]"
+          onClick={() => setShowIOSGuide(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="ios-install-title"
+        >
+          <div
+            className="w-full max-w-sm max-h-full overflow-y-auto bg-white rounded-2xl p-5 shadow-xl animate-slide-up"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between mb-4">
-              <h3 className="font-semibold text-neutral-900">Install on iPhone / iPad</h3>
+              <h3 id="ios-install-title" className="font-semibold text-neutral-900">Install on iPhone / iPad</h3>
               <button onClick={() => setShowIOSGuide(false)} className="p-1 rounded-lg text-neutral-400 hover:bg-neutral-100" aria-label="Close">
                 <X className="w-5 h-5" aria-hidden="true" />
               </button>
@@ -198,13 +226,22 @@ export function PWAInstall() {
               </li>
             </ol>
             <p className="mt-4 text-xs text-neutral-500">Use Safari — other iOS browsers may not offer this option.</p>
+            <button
+              type="button"
+              onClick={() => setShowIOSGuide(false)}
+              className="mt-4 w-full rounded-lg bg-emerald-500 py-2.5 text-sm font-medium text-white hover:bg-emerald-600"
+            >
+              Got it
+            </button>
           </div>
-        </div>
-      )}
+        </div>,
+          document.body
+        )}
 
       {/* New version available */}
-      {updateReady && (
-        <div className="fixed top-20 left-4 right-4 md:left-auto md:right-4 md:w-96 z-50 animate-slide-up">
+      {updateReady &&
+        createPortal(
+        <div className="fixed top-[max(5rem,calc(env(safe-area-inset-top)+4.5rem))] left-4 right-4 md:left-auto md:right-4 md:w-96 z-[100] animate-slide-up">
           <div className="flex items-center gap-3 rounded-xl bg-neutral-900 text-white p-3 pl-4 shadow-xl">
             <p className="text-sm flex-1">A new version is available.</p>
             <button
@@ -215,8 +252,9 @@ export function PWAInstall() {
               Reload
             </button>
           </div>
-        </div>
-      )}
+        </div>,
+          document.body
+        )}
     </>
   );
 }
