@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { Download, X, Info } from 'lucide-react';
+import { useState, useEffect, useCallback, useSyncExternalStore } from 'react';
+import { Download, X, Share, SquarePlus, WifiOff, RefreshCw } from 'lucide-react';
 
 interface BeforeInstallPromptEvent extends Event {
   readonly platforms: string[];
@@ -9,147 +9,215 @@ interface BeforeInstallPromptEvent extends Event {
   prompt(): Promise<void>;
 }
 
-const isIOSDevice = (): boolean => {
-  if (typeof navigator === 'undefined') return false;
+// ---- tiny external stores (no hydration mismatch, no setState-in-effect) ----
+const noopSubscribe = () => () => {};
+
+function subscribeStandalone(cb: () => void) {
+  const mq = window.matchMedia('(display-mode: standalone)');
+  mq.addEventListener('change', cb);
+  return () => mq.removeEventListener('change', cb);
+}
+function getStandalone() {
+  return (
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (navigator as Navigator & { standalone?: boolean }).standalone === true
+  );
+}
+
+function subscribeOnline(cb: () => void) {
+  window.addEventListener('online', cb);
+  window.addEventListener('offline', cb);
+  return () => {
+    window.removeEventListener('online', cb);
+    window.removeEventListener('offline', cb);
+  };
+}
+
+function getIsIOS() {
   const ua = navigator.userAgent;
-  return /iPad|iPhone|iPod/.test(ua) && !('MSStream' in window);
-};
-
-const isStandaloneMode = (): boolean => {
-  if (typeof window === 'undefined') return false;
-  return window.matchMedia('(display-mode: standalone)').matches;
-};
-
-const getInitialDismissed = (): boolean => {
-  if (typeof window === 'undefined') return false;
-  return localStorage.getItem('pwa-install-dismissed') === 'true';
-};
+  const iPadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+  return /iPad|iPhone|iPod/.test(ua) || iPadOS;
+}
 
 export function PWAInstall() {
-  const [showInstall, setShowInstall] = useState(false);
-  const [isIOS] = useState(isIOSDevice);
-  const [isStandalone] = useState(isStandaloneMode);
-  const [dismissed, setDismissed] = useState(getInitialDismissed);
-  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
-  const [mounted] = useState(() => typeof window !== 'undefined');
+  const isStandalone = useSyncExternalStore(subscribeStandalone, getStandalone, () => false);
+  const isOnline = useSyncExternalStore(subscribeOnline, () => navigator.onLine, () => true);
+  const isIOS = useSyncExternalStore(noopSubscribe, getIsIOS, () => false);
 
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [showIOSGuide, setShowIOSGuide] = useState(false);
+  const [updateReady, setUpdateReady] = useState(false);
+  const [installed, setInstalled] = useState(false);
+
+  // Install prompt events
   useEffect(() => {
-    const handleBeforeInstallPrompt = (e: Event) => {
+    const onPrompt = (e: Event) => {
       e.preventDefault();
       setDeferredPrompt(e as BeforeInstallPromptEvent);
-      if (!isStandalone) setShowInstall(true);
     };
-
-    const handleAppInstalled = () => {
-      setShowInstall(false);
+    const onInstalled = () => {
+      setInstalled(true);
       setDeferredPrompt(null);
     };
-
-    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-    window.addEventListener('appinstalled', handleAppInstalled);
-
+    window.addEventListener('beforeinstallprompt', onPrompt);
+    window.addEventListener('appinstalled', onInstalled);
     return () => {
-      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-      window.removeEventListener('appinstalled', handleAppInstalled);
+      window.removeEventListener('beforeinstallprompt', onPrompt);
+      window.removeEventListener('appinstalled', onInstalled);
     };
-  }, [isStandalone]);
+  }, []);
 
+  // Service worker registration
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return;
+    const sw = navigator.serviceWorker;
 
     if (process.env.NODE_ENV !== 'production') {
-      // In development a service worker serves stale JS/CSS, so code changes never show up.
-      // Remove any previously registered worker and its caches.
-      navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((r) => r.unregister()));
-      if ('caches' in window) {
-        caches.keys().then((names) => names.forEach((n) => caches.delete(n)));
-      }
+      // Dev: a service worker serves stale code. Remove it (and its caches) and reload once.
+      const wasControlled = !!sw.controller;
+      Promise.all([
+        sw.getRegistrations().then((regs) => Promise.all(regs.map((r) => r.unregister()))),
+        'caches' in window ? caches.keys().then((ks) => Promise.all(ks.map((k) => caches.delete(k)))) : null,
+      ]).then(() => {
+        if (wasControlled && !sessionStorage.getItem('sw-dev-cleaned')) {
+          sessionStorage.setItem('sw-dev-cleaned', '1');
+          window.location.reload();
+        }
+      });
       return;
     }
 
-    navigator.serviceWorker
-      .register('/sw.js', { scope: '/', updateViaCache: 'none' })
-      .then((reg) => reg.update())
-      .catch((err) => console.warn('SW registration failed:', err));
+    const hadController = !!sw.controller;
+    const onControllerChange = () => {
+      // A new version took over — offer a reload (skip on the very first install)
+      if (hadController) setUpdateReady(true);
+    };
+    sw.addEventListener('controllerchange', onControllerChange);
+
+    const register = () => {
+      sw.register('/sw.js', { scope: '/', updateViaCache: 'none' })
+        .then(async (reg) => {
+          await sw.ready;
+          // Cache everything the first page load already fetched, so offline works right away
+          const urls = [
+            window.location.pathname,
+            ...performance
+              .getEntriesByType('resource')
+              .map((entry) => entry.name)
+              .filter((u) => u.startsWith(window.location.origin)),
+          ];
+          (reg.active ?? sw.controller)?.postMessage({ type: 'CACHE_URLS', urls });
+          reg.update().catch(() => undefined);
+        })
+        .catch((err) => console.warn('SW registration failed:', err));
+    };
+
+    if (document.readyState === 'complete') register();
+    else window.addEventListener('load', register, { once: true });
+
+    // Check for a new version when the app comes back to the foreground
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        sw.getRegistration().then((reg) => reg?.update().catch(() => undefined));
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      sw.removeEventListener('controllerchange', onControllerChange);
+      window.removeEventListener('load', register);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   const handleInstall = useCallback(async () => {
-    if (!deferredPrompt) return;
-    try {
-      await deferredPrompt.prompt();
-      const { outcome } = await deferredPrompt.userChoice;
-      if (outcome === 'accepted') {
-        setShowInstall(false);
-        setDeferredPrompt(null);
+    if (deferredPrompt) {
+      try {
+        await deferredPrompt.prompt();
+        const { outcome } = await deferredPrompt.userChoice;
+        if (outcome === 'accepted') setInstalled(true);
+      } catch (err) {
+        console.warn('Install prompt failed:', err);
       }
-    } catch (err) {
-      console.warn('Install prompt failed:', err);
+      setDeferredPrompt(null);
+      return;
     }
-  }, [deferredPrompt]);
+    if (isIOS) setShowIOSGuide(true);
+  }, [deferredPrompt, isIOS]);
 
-  const dismiss = useCallback(() => {
-    setShowInstall(false);
-    setDismissed(true);
-    localStorage.setItem('pwa-install-dismissed', 'true');
-  }, []);
-
-  if (!mounted || isStandalone || dismissed || !showInstall) return null;
+  const canInstall = !isStandalone && !installed && (!!deferredPrompt || isIOS);
 
   return (
-    <div className="fixed bottom-4 left-4 right-4 md:left-auto md:right-4 md:w-auto md:max-w-md z-50 animate-slide-up">
-      <div className="bg-white rounded-2xl border border-neutral-200 shadow-xl p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-3 flex-1">
-            <div className="w-10 h-10 rounded-xl bg-emerald-500 flex items-center justify-center flex-shrink-0">
-              <svg className="w-6 h-6 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <rect x="8" y="8" width="3" height="3" />
-                <rect x="13" y="8" width="3" height="3" />
-                <rect x="8" y="13" width="3" height="3" />
-                <rect x="13" y="13" width="3" height="3" />
-              </svg>
-            </div>
-            <div>
-              <h3 className="font-semibold text-neutral-900">Install QR Generator</h3>
-              <p className="text-sm text-neutral-500">Add to home screen for offline access</p>
-            </div>
-          </div>
-          <button onClick={dismiss} className="p-1 rounded-lg text-neutral-400 hover:text-neutral-600 hover:bg-neutral-100 transition-colors flex-shrink-0" aria-label="Dismiss">
-            <X className="w-5 h-5" aria-hidden="true" />
+    <>
+      {/* Header controls */}
+      <div className="flex shrink-0 items-center gap-2">
+        {!isOnline && (
+          <span className="inline-flex h-8 shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-amber-100 px-2.5 text-xs font-medium leading-none text-amber-800">
+            <WifiOff className="w-3.5 h-3.5" aria-hidden="true" />
+            Offline
+          </span>
+        )}
+        {canInstall && (
+          <button
+            type="button"
+            onClick={handleInstall}
+            className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-emerald-500 px-3.5 text-sm font-medium leading-none text-white hover:bg-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2"
+          >
+            <Download className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>Install</span>
           </button>
-        </div>
-
-        <div className="mt-3 flex gap-2">
-          {deferredPrompt && (
-            <button
-              onClick={handleInstall}
-              className="flex-1 py-2.5 bg-emerald-500 text-white rounded-lg font-medium text-sm hover:bg-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 flex items-center justify-center gap-2"
-            >
-              <Download className="w-4 h-4" aria-hidden="true" />
-              Install
-            </button>
-          )}
-
-          {isIOS && (
-            <button
-              onClick={() => setShowInstall(false)}
-              className="flex-1 py-2.5 bg-white border border-neutral-200 rounded-lg font-medium text-neutral-700 hover:bg-neutral-50 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent flex items-center justify-center gap-2"
-            >
-              <Info className="w-4 h-4" aria-hidden="true" />
-              iOS Guide
-            </button>
-          )}
-        </div>
-
-        {isIOS && (
-          <div className="mt-3 p-3 bg-neutral-50 rounded-lg border border-neutral-200">
-            <p className="text-sm text-neutral-600">
-              Tap the share button <span className="inline-flex items-center justify-center w-5 h-5 rounded bg-neutral-200 text-neutral-700 text-xs font-mono ml-1 mr-1">⎋</span> then <strong>Add to Home Screen</strong>.
-            </p>
-          </div>
         )}
       </div>
-    </div>
+
+      {/* iOS: Safari has no install prompt, so show the steps */}
+      {showIOSGuide && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-4" onClick={() => setShowIOSGuide(false)}>
+          <div className="w-full max-w-sm bg-white rounded-2xl p-5 shadow-xl animate-slide-up" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold text-neutral-900">Install on iPhone / iPad</h3>
+              <button onClick={() => setShowIOSGuide(false)} className="p-1 rounded-lg text-neutral-400 hover:bg-neutral-100" aria-label="Close">
+                <X className="w-5 h-5" aria-hidden="true" />
+              </button>
+            </div>
+            <ol className="space-y-3 text-sm text-neutral-700">
+              <li className="flex items-center gap-3">
+                <span className="w-8 h-8 rounded-lg bg-neutral-100 flex items-center justify-center shrink-0">
+                  <Share className="w-4 h-4 text-blue-600" aria-hidden="true" />
+                </span>
+                Tap the <strong>Share</strong> button in Safari&apos;s toolbar
+              </li>
+              <li className="flex items-center gap-3">
+                <span className="w-8 h-8 rounded-lg bg-neutral-100 flex items-center justify-center shrink-0">
+                  <SquarePlus className="w-4 h-4 text-neutral-700" aria-hidden="true" />
+                </span>
+                Choose <strong>Add to Home Screen</strong>
+              </li>
+              <li className="flex items-center gap-3">
+                <span className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 font-semibold flex items-center justify-center shrink-0">✓</span>
+                Tap <strong>Add</strong> — the app appears on your home screen
+              </li>
+            </ol>
+            <p className="mt-4 text-xs text-neutral-500">Use Safari — other iOS browsers may not offer this option.</p>
+          </div>
+        </div>
+      )}
+
+      {/* New version available */}
+      {updateReady && (
+        <div className="fixed top-20 left-4 right-4 md:left-auto md:right-4 md:w-96 z-50 animate-slide-up">
+          <div className="flex items-center gap-3 rounded-xl bg-neutral-900 text-white p-3 pl-4 shadow-xl">
+            <p className="text-sm flex-1">A new version is available.</p>
+            <button
+              onClick={() => window.location.reload()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-sm font-medium hover:bg-emerald-600"
+            >
+              <RefreshCw className="w-4 h-4" aria-hidden="true" />
+              Reload
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

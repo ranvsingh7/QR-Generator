@@ -36,9 +36,12 @@ export const metadata: Metadata = {
     description: 'Generate customizable QR codes offline.',
   },
   icons: {
-    icon: '/icon.png',
-    shortcut: '/icon-192x192.png',
-    apple: '/apple-icon.png',
+    icon: [
+      { url: '/favicon.ico', sizes: 'any' },
+      { url: '/icon.png', type: 'image/png', sizes: '512x512' },
+    ],
+    shortcut: '/icons/icon-192x192.png',
+    apple: [{ url: '/apple-icon.png', sizes: '180x180', type: 'image/png' }],
   },
   manifest: '/manifest.webmanifest',
   appleWebApp: {
@@ -46,13 +49,17 @@ export const metadata: Metadata = {
     statusBarStyle: 'default',
     title: 'QR Generator',
   },
+  other: {
+    // Older Android Chrome + iOS still read this tag
+    'mobile-web-app-capable': 'yes',
+  },
   formatDetection: {
     telephone: false,
   },
 };
 
 export const viewport: Viewport = {
-  themeColor: '#1a1a1a',
+  themeColor: '#ffffff',
   width: 'device-width',
   initialScale: 1,
   maximumScale: 5,
@@ -63,10 +70,6 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" style={{ colorScheme: "light" }} className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" crossOrigin="anonymous" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-      </head>
       <body className="min-h-full flex flex-col bg-white text-neutral-900">
         {children}
       </body>
